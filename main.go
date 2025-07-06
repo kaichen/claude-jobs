@@ -9,12 +9,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
 	"math"
 	"math/big"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,6 +26,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
+
+var logger = slog.Default()
 
 // SQL schema for the claude_jobs table
 const createTableSQL = `
@@ -82,7 +86,7 @@ type Worker struct {
 }
 
 // JobHandler is a function that processes a job
-type JobHandler func(context.Context, json.RawMessage) error
+type JobHandler func(context.Context, *Job) error
 
 // EnqueueOptions for job enqueuing
 type EnqueueOptions struct {
@@ -122,13 +126,13 @@ func (w *Worker) RegisterHandler(jobType string, handler JobHandler) {
 }
 
 // DefaultHandler executes claude CLI with the provided prompt and working directory
-func DefaultHandler(ctx context.Context, payload json.RawMessage) error {
+func DefaultHandler(ctx context.Context, job *Job) error {
 	var params struct {
 		Prompt string `json:"prompt"`
 		Cwd    string `json:"cwd"`
 	}
 
-	if err := json.Unmarshal(payload, &params); err != nil {
+	if err := json.Unmarshal(job.Payload, &params); err != nil {
 		return fmt.Errorf("failed to parse payload: %w", err)
 	}
 
@@ -157,18 +161,55 @@ func DefaultHandler(ctx context.Context, payload json.RawMessage) error {
 		}
 	}
 
-	log.Printf("Executing claude in directory %s with prompt: %s", params.Cwd, params.Prompt)
+	// Create log directory in user's home directory
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("failed to get home directory: %w", err)
+	}
+	logDir := filepath.Join(homeDir, ".local", "shared", "claude-jobs", "logs")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return fmt.Errorf("failed to create log directory: %w", err)
+	}
+
+	// Create log file paths using job ID and timestamp
+	timestamp := time.Now().Format("20060102-150405")
+	stdoutPath := filepath.Join(logDir, fmt.Sprintf("%s-%s.stdout.log", job.ID, timestamp))
+	stderrPath := filepath.Join(logDir, fmt.Sprintf("%s-%s.stderr.log", job.ID, timestamp))
+
+	// Create stdout log file
+	stdoutFile, err := os.Create(stdoutPath)
+	if err != nil {
+		return fmt.Errorf("failed to create stdout log file: %w", err)
+	}
+	defer stdoutFile.Close()
+
+	// Create stderr log file
+	stderrFile, err := os.Create(stderrPath)
+	if err != nil {
+		return fmt.Errorf("failed to create stderr log file: %w", err)
+	}
+	defer stderrFile.Close()
+
+	logger.Info("Executing claude",
+		"directory", params.Cwd,
+		"prompt", params.Prompt,
+		"jobID", job.ID,
+		"stdoutLog", stdoutPath,
+		"stderrLog", stderrPath)
 
 	cmd := exec.CommandContext(ctx, "claude", "--dangerously-skip-permissions", "--verbose", "-p", params.Prompt)
 	cmd.Dir = params.Cwd
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+
+	// Redirect output to both console and log files
+	cmd.Stdout = io.MultiWriter(os.Stdout, stdoutFile)
+	cmd.Stderr = io.MultiWriter(os.Stderr, stderrFile)
 
 	// Execute the command
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("claude execution failed: %w", err)
 	}
 
+	logger.Info("Job output logged", "jobID", job.ID, "stdout", stdoutPath, "stderr", stderrPath)
 	return nil
 }
 
@@ -209,10 +250,10 @@ func Enqueue(ctx context.Context, databaseURL string, payload interface{}, opts 
 	// Notify listeners about the new job
 	_, err = conn.Exec(ctx, fmt.Sprintf("NOTIFY good_job, '%s'", opts.Queue))
 	if err != nil {
-		log.Printf("Failed to send notification: %v", err)
+		logger.Error("Failed to send notification", "error", err)
 	}
 
-	log.Printf("Enqueued job %s to queue %s", jobID, opts.Queue)
+	logger.Info("Enqueued job", "jobID", jobID, "queue", opts.Queue)
 	return nil
 }
 
@@ -290,8 +331,11 @@ func (w *Worker) fetch(ctx context.Context) (*Job, error) {
 
 // execute processes a job
 func (w *Worker) execute(ctx context.Context, job *Job) error {
-	log.Printf("Executing job %s from queue %s (attempt %d/%d)",
-		job.ID, job.Queue, job.Attempts+1, job.MaxAttempts)
+	logger.Info("Executing job",
+		"jobID", job.ID,
+		"queue", job.Queue,
+		"attempt", job.Attempts+1,
+		"maxAttempts", job.MaxAttempts)
 
 	// Parse payload to determine job type
 	var payload map[string]interface{}
@@ -309,7 +353,7 @@ func (w *Worker) execute(ctx context.Context, job *Job) error {
 
 	// Execute the job
 	startTime := time.Now()
-	err := handler(ctx, job.Payload)
+	err := handler(ctx, job)
 	duration := time.Since(startTime)
 
 	if err != nil {
@@ -337,7 +381,10 @@ func (w *Worker) handleJobError(ctx context.Context, job *Job, jobErr error) err
 			return fmt.Errorf("failed to update failed job: %w", err)
 		}
 
-		log.Printf("Job %s failed after %d attempts: %v", job.ID, job.Attempts, jobErr)
+		logger.Error("Job failed after max attempts",
+			"jobID", job.ID,
+			"attempts", job.Attempts,
+			"error", jobErr)
 	} else {
 		// Schedule retry with exponential backoff
 		retryDelay := time.Duration(math.Pow(2, float64(job.Attempts-1))) * time.Second
@@ -357,15 +404,18 @@ func (w *Worker) handleJobError(ctx context.Context, job *Job, jobErr error) err
 			return fmt.Errorf("failed to update job for retry: %w", err)
 		}
 
-		log.Printf("Job %s scheduled for retry at %v (attempt %d/%d)",
-			job.ID, nextRunAt, job.Attempts, job.MaxAttempts)
+		logger.Info("Job scheduled for retry",
+			"jobID", job.ID,
+			"nextRunAt", nextRunAt,
+			"attempt", job.Attempts,
+			"maxAttempts", job.MaxAttempts)
 	}
 
 	// Release advisory lock
 	lockKey := calculateLockKey(job.ID)
 	_, err := w.pool.Exec(ctx, "SELECT pg_advisory_unlock($1)", lockKey)
 	if err != nil {
-		log.Printf("Failed to release lock for job %s: %v", job.ID, err)
+		logger.Error("Failed to release lock", "jobID", job.ID, "error", err)
 	}
 
 	return nil
@@ -388,10 +438,10 @@ func (w *Worker) completeJob(ctx context.Context, job *Job, duration time.Durati
 	lockKey := calculateLockKey(job.ID)
 	_, err = w.pool.Exec(ctx, "SELECT pg_advisory_unlock($1)", lockKey)
 	if err != nil {
-		log.Printf("Failed to release lock for job %s: %v", job.ID, err)
+		logger.Error("Failed to release lock", "jobID", job.ID, "error", err)
 	}
 
-	log.Printf("Job %s completed successfully in %v", job.ID, duration)
+	logger.Info("Job completed successfully", "jobID", job.ID, "duration", duration)
 	return nil
 }
 
@@ -399,18 +449,18 @@ func (w *Worker) completeJob(ctx context.Context, job *Job, duration time.Durati
 func (w *Worker) listenForNotifications() {
 	conn, err := w.pool.Acquire(w.ctx)
 	if err != nil {
-		log.Printf("Failed to acquire connection for LISTEN: %v", err)
+		logger.Error("Failed to acquire connection for LISTEN", "error", err)
 		return
 	}
 	defer conn.Release()
 
 	_, err = conn.Exec(w.ctx, "LISTEN good_job")
 	if err != nil {
-		log.Printf("Failed to LISTEN: %v", err)
+		logger.Error("Failed to LISTEN", "error", err)
 		return
 	}
 
-	log.Println("Listening for job notifications...")
+	logger.Info("Listening for job notifications")
 
 	for {
 		notification, err := conn.Conn().WaitForNotification(w.ctx)
@@ -418,7 +468,7 @@ func (w *Worker) listenForNotifications() {
 			if errors.Is(err, context.Canceled) {
 				return
 			}
-			log.Printf("Error waiting for notification: %v", err)
+			logger.Error("Error waiting for notification", "error", err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
@@ -437,12 +487,12 @@ func (w *Worker) listenForNotifications() {
 func (w *Worker) processJobs(workerID int) {
 	defer w.wg.Done()
 
-	log.Printf("Worker %d started", workerID)
+	logger.Info("Worker started", "workerID", workerID)
 
 	for {
 		select {
 		case <-w.ctx.Done():
-			log.Printf("Worker %d stopping", workerID)
+			logger.Info("Worker stopping", "workerID", workerID)
 			return
 		default:
 		}
@@ -450,7 +500,7 @@ func (w *Worker) processJobs(workerID int) {
 		// Try to fetch a job
 		job, err := w.fetch(w.ctx)
 		if err != nil {
-			log.Printf("Worker %d: Error fetching job: %v", workerID, err)
+			logger.Error("Error fetching job", "workerID", workerID, "error", err)
 			time.Sleep(time.Second)
 			continue
 		}
@@ -470,15 +520,16 @@ func (w *Worker) processJobs(workerID int) {
 
 		// Process the job
 		if err := w.execute(w.ctx, job); err != nil {
-			log.Printf("Worker %d: Error executing job %s: %v", workerID, job.ID, err)
+			logger.Error("Error executing job", "workerID", workerID, "jobID", job.ID, "error", err)
 		}
 	}
 }
 
 // Start begins processing jobs
 func (w *Worker) Start() error {
-	log.Printf("Starting worker with %d concurrent workers for queues: %v",
-		w.config.Concurrency, w.config.Queues)
+	logger.Info("Starting worker",
+		"concurrency", w.config.Concurrency,
+		"queues", w.config.Queues)
 
 	// Start notification listener
 	go w.listenForNotifications()
@@ -495,9 +546,9 @@ func (w *Worker) Start() error {
 
 	select {
 	case sig := <-sigCh:
-		log.Printf("Received signal %v, shutting down gracefully...", sig)
+		logger.Info("Received signal, shutting down gracefully", "signal", sig)
 	case <-w.ctx.Done():
-		log.Println("Context cancelled, shutting down...")
+		logger.Info("Context cancelled, shutting down")
 	}
 
 	// Cancel context to stop all workers
@@ -512,9 +563,9 @@ func (w *Worker) Start() error {
 
 	select {
 	case <-done:
-		log.Println("All workers stopped gracefully")
+		logger.Info("All workers stopped gracefully")
 	case <-time.After(30 * time.Second):
-		log.Println("Shutdown timeout exceeded")
+		logger.Warn("Shutdown timeout exceeded")
 	}
 
 	// Close database pool
@@ -536,7 +587,7 @@ func migrate(databaseURL string) error {
 		return fmt.Errorf("failed to create table: %w", err)
 	}
 
-	log.Println("Database migration completed successfully")
+	logger.Info("Database migration completed successfully")
 	return nil
 }
 
@@ -570,11 +621,13 @@ func runMigrate(args []string) {
 	fs.Parse(args)
 
 	if *databaseURL == "" {
-		log.Fatal("Database URL is required (use --database-url or DATABASE_URL env var)")
+		logger.Error("Database URL is required (use --database-url or DATABASE_URL env var)")
+		os.Exit(1)
 	}
 
 	if err := migrate(*databaseURL); err != nil {
-		log.Fatal(err)
+		logger.Error("Migration failed", "error", err)
+		os.Exit(1)
 	}
 }
 
@@ -590,42 +643,50 @@ func runEnqueue(args []string) {
 	fs.Parse(args)
 
 	if *databaseURL == "" {
-		log.Fatal("Database URL is required (use --database-url or DATABASE_URL env var)")
+		logger.Error("Database URL is required (use --database-url or DATABASE_URL env var)")
+		os.Exit(1)
 	}
 
 	var payloadData map[string]interface{}
 	if err := json.Unmarshal([]byte(*payload), &payloadData); err != nil {
-		log.Fatalf("Invalid JSON payload: %v", err)
+		logger.Error("Invalid JSON payload", "error", err)
+		os.Exit(1)
 	}
 
 	// Validate prompt field
 	prompt, ok := payloadData["prompt"].(string)
 	if !ok || strings.TrimSpace(prompt) == "" {
-		log.Fatal("Payload must contain a non-empty 'prompt' field")
+		logger.Error("Payload must contain a non-empty 'prompt' field")
+		os.Exit(1)
 	}
 
 	// Validate cwd field if provided
 	if cwdInterface, exists := payloadData["cwd"]; exists {
 		cwd, ok := cwdInterface.(string)
 		if !ok {
-			log.Fatal("The 'cwd' field must be a string")
+			logger.Error("The 'cwd' field must be a string")
+			os.Exit(1)
 		}
 
 		if strings.TrimSpace(cwd) == "" {
-			log.Fatal("The 'cwd' field cannot be blank")
+			logger.Error("The 'cwd' field cannot be blank")
+			os.Exit(1)
 		}
 
 		// Check if cwd path exists
 		info, err := os.Stat(cwd)
 		if err != nil {
 			if os.IsNotExist(err) {
-				log.Fatalf("The specified working directory does not exist: %s", cwd)
+				logger.Error("The specified working directory does not exist", "cwd", cwd)
+				os.Exit(1)
 			}
-			log.Fatalf("Error checking working directory: %v", err)
+			logger.Error("Error checking working directory", "error", err)
+			os.Exit(1)
 		}
 
 		if !info.IsDir() {
-			log.Fatalf("The specified working directory is not a directory: %s", cwd)
+			logger.Error("The specified working directory is not a directory", "cwd", cwd)
+			os.Exit(1)
 		}
 	}
 
@@ -637,7 +698,8 @@ func runEnqueue(args []string) {
 	}
 
 	if err := Enqueue(context.Background(), *databaseURL, payloadData, opts); err != nil {
-		log.Fatal(err)
+		logger.Error("Enqueue failed", "error", err)
+		os.Exit(1)
 	}
 }
 
@@ -650,7 +712,8 @@ func runWorker(args []string) {
 	fs.Parse(args)
 
 	if *databaseURL == "" {
-		log.Fatal("Database URL is required (use --database-url or DATABASE_URL env var)")
+		logger.Error("Database URL is required (use --database-url or DATABASE_URL env var)")
+		os.Exit(1)
 	}
 
 	config := &Config{
@@ -662,14 +725,16 @@ func runWorker(args []string) {
 
 	worker, err := NewWorker(config)
 	if err != nil {
-		log.Fatal(err)
+		logger.Error("Failed to create worker", "error", err)
+		os.Exit(1)
 	}
 
 	// Register claude handler for jobs with type "claude"
 	worker.RegisterHandler("claude", DefaultHandler)
 
 	if err := worker.Start(); err != nil {
-		log.Fatal(err)
+		logger.Error("Worker failed to start", "error", err)
+		os.Exit(1)
 	}
 }
 
