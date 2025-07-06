@@ -1,0 +1,5 @@
+- [ ] claude jobs config folder to $HOME/.local/claude-jobs
+- [ ] add web dashboard using tailwind and htmx, list jobs
+- [ ] use golang built-in log/slog
+- [ ] worker logging to config folder files as $jobid.log
+- [ ] integrate with git tree
