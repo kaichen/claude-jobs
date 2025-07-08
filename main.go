@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"math"
 	"math/big"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -28,6 +29,169 @@ import (
 )
 
 var logger = slog.Default()
+
+const dashboardHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude Jobs Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+</head>
+<body class="bg-gray-100">
+    <div class="container mx-auto px-4 py-8">
+        <h1 class="text-3xl font-bold text-gray-800 mb-8">Claude Jobs Dashboard</h1>
+        
+        <!-- Stats Cards -->
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8" hx-get="/api/stats" hx-trigger="load, every 2s" hx-swap="innerHTML">
+            Loading stats...
+        </div>
+        
+        <!-- Tabs -->
+        <div class="mb-4">
+            <div class="border-b border-gray-200">
+                <nav class="-mb-px flex space-x-8">
+                    <button onclick="loadJobs('')" class="tab-button border-b-2 border-blue-500 py-2 px-1 text-sm font-medium text-blue-600">All</button>
+                    <button onclick="loadJobs('queued')" class="tab-button border-b-2 border-transparent py-2 px-1 text-sm font-medium text-gray-500 hover:text-gray-700 hover:border-gray-300">Queued</button>
+                    <button onclick="loadJobs('running')" class="tab-button border-b-2 border-transparent py-2 px-1 text-sm font-medium text-gray-500 hover:text-gray-700 hover:border-gray-300">Running</button>
+                    <button onclick="loadJobs('finished')" class="tab-button border-b-2 border-transparent py-2 px-1 text-sm font-medium text-gray-500 hover:text-gray-700 hover:border-gray-300">Finished</button>
+                    <button onclick="loadJobs('failed')" class="tab-button border-b-2 border-transparent py-2 px-1 text-sm font-medium text-gray-500 hover:text-gray-700 hover:border-gray-300">Failed</button>
+                </nav>
+            </div>
+        </div>
+        
+        <!-- Jobs Table -->
+        <div class="bg-white shadow-md rounded-lg overflow-hidden">
+            <div id="jobs-table" hx-get="/api/jobs" hx-trigger="load, every 5s">
+                Loading jobs...
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function loadJobs(status) {
+            const url = status ? '/api/jobs?status=' + status : '/api/jobs';
+            htmx.ajax('GET', url, '#jobs-table');
+            
+            // Update tab styles
+            document.querySelectorAll('.tab-button').forEach(btn => {
+                btn.classList.remove('border-blue-500', 'text-blue-600');
+                btn.classList.add('border-transparent', 'text-gray-500');
+            });
+            event.target.classList.remove('border-transparent', 'text-gray-500');
+            event.target.classList.add('border-blue-500', 'text-blue-600');
+        }
+
+        // Replace stats response
+        htmx.on("htmx:afterSwap", function(evt) {
+            if (evt.detail.target.getAttribute('hx-get') === '/api/stats') {
+                const stats = JSON.parse(evt.detail.xhr.responseText);
+                evt.detail.target.innerHTML = ` + "`" + `
+                    <div class="bg-white p-6 rounded-lg shadow">
+                        <div class="text-2xl font-bold text-gray-800">${stats.queued}</div>
+                        <div class="text-gray-600">Queued</div>
+                    </div>
+                    <div class="bg-white p-6 rounded-lg shadow">
+                        <div class="text-2xl font-bold text-blue-600">${stats.running}</div>
+                        <div class="text-gray-600">Running</div>
+                    </div>
+                    <div class="bg-white p-6 rounded-lg shadow">
+                        <div class="text-2xl font-bold text-green-600">${stats.finished}</div>
+                        <div class="text-gray-600">Finished</div>
+                    </div>
+                    <div class="bg-white p-6 rounded-lg shadow">
+                        <div class="text-2xl font-bold text-red-600">${stats.failed}</div>
+                        <div class="text-gray-600">Failed</div>
+                    </div>
+                ` + "`" + `;
+            }
+            
+            // Replace jobs response
+            if (evt.detail.target.id === 'jobs-table') {
+                const jobs = JSON.parse(evt.detail.xhr.responseText);
+                if (!jobs || jobs.length === 0) {
+                    evt.detail.target.innerHTML = '<div class="p-8 text-center text-gray-500">No jobs found</div>';
+                    return;
+                }
+                
+                let tableHTML = ` + "`" + `
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ID</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Queue</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Payload</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Attempts</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Created</th>
+                            </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200">
+                ` + "`" + `;
+                
+                jobs.forEach(job => {
+                    const statusColor = {
+                        'queued': 'text-yellow-600 bg-yellow-100',
+                        'running': 'text-blue-600 bg-blue-100',
+                        'finished': 'text-green-600 bg-green-100',
+                        'failed': 'text-red-600 bg-red-100'
+                    }[job.status] || 'text-gray-600 bg-gray-100';
+                    
+                    const payload = JSON.parse(job.payload);
+                    const payloadStr = payload.prompt ? payload.prompt.substring(0, 50) + '...' : JSON.stringify(payload).substring(0, 50) + '...';
+                    
+                    tableHTML += ` + "`" + `
+                        <tr>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${job.id.substring(0, 8)}...</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${job.queue}</td>
+                            <td class="px-6 py-4 whitespace-nowrap">
+                                <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${statusColor}">
+                                    ${job.status}
+                                </span>
+                            </td>
+                            <td class="px-6 py-4 text-sm text-gray-500" title="${job.payload.replace(/"/g, '&quot;')}">${payloadStr}</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${job.attempts}/${job.max_attempts}</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${new Date(job.created_at).toLocaleString()}</td>
+                        </tr>
+                    ` + "`" + `;
+                });
+                
+                tableHTML += '</tbody></table>';
+                evt.detail.target.innerHTML = tableHTML;
+            }
+        });
+    </script>
+</body>
+</html>` + "`"
+
+// DashboardServer handles the web dashboard
+type DashboardServer struct {
+	pool *pgxpool.Pool
+}
+
+// JobStats represents job statistics
+type JobStats struct {
+	Queued   int `json:"queued"`
+	Running  int `json:"running"`
+	Finished int `json:"finished"`
+	Failed   int `json:"failed"`
+}
+
+// JobView represents a job for display
+type JobView struct {
+	ID          string     `json:"id"`
+	Queue       string     `json:"queue"`
+	Priority    int        `json:"priority"`
+	Status      string     `json:"status"`
+	Payload     string     `json:"payload"`
+	Error       *string    `json:"error"`
+	Attempts    int        `json:"attempts"`
+	MaxAttempts int        `json:"max_attempts"`
+	CreatedAt   time.Time  `json:"created_at"`
+	RunAt       time.Time  `json:"run_at"`
+	FinishedAt  *time.Time `json:"finished_at"`
+}
 
 // SQL schema for the claude_jobs table
 const createTableSQL = `
@@ -197,7 +361,7 @@ func DefaultHandler(ctx context.Context, job *Job) error {
 		"stdoutLog", stdoutPath,
 		"stderrLog", stderrPath)
 
-	cmd := exec.CommandContext(ctx, "claude", "--dangerously-skip-permissions", "--verbose", "-p", params.Prompt)
+	cmd := exec.CommandContext(ctx, "claude", "--dangerously-skip-permissions", "--verbose", "--print", params.Prompt)
 	cmd.Dir = params.Cwd
 
 	// Redirect output to both console and log files
@@ -248,7 +412,7 @@ func Enqueue(ctx context.Context, databaseURL string, payload interface{}, opts 
 	}
 
 	// Notify listeners about the new job
-	_, err = conn.Exec(ctx, fmt.Sprintf("NOTIFY good_job, '%s'", opts.Queue))
+	_, err = conn.Exec(ctx, fmt.Sprintf("NOTIFY claude_job, '%s'", opts.Queue))
 	if err != nil {
 		logger.Error("Failed to send notification", "error", err)
 	}
@@ -271,62 +435,36 @@ func calculateLockKey(jobID string) int64 {
 // fetch attempts to fetch and lock a job
 func (w *Worker) fetch(ctx context.Context) (*Job, error) {
 	query := `
-		WITH candidate AS (
-			SELECT id, queue, priority, run_at, payload, error, attempts, max_attempts, finished_at, created_at
+		WITH available_jobs AS (
+			SELECT id, queue, priority, run_at, payload, error, attempts, max_attempts, finished_at, created_at,
+				   ('x' || substring(md5(id::text) for 16))::bit(64)::bigint as lock_key
 			FROM claude_jobs
 			WHERE queue = ANY($1)
 				AND run_at <= now()
 				AND finished_at IS NULL
 			ORDER BY priority DESC, created_at ASC
-			LIMIT 1
+			LIMIT 10
 		)
 		SELECT id, queue, priority, run_at, payload, error, attempts, max_attempts, finished_at, created_at
-		FROM candidate
-		WHERE pg_try_advisory_lock($2::bigint)
+		FROM available_jobs
+		WHERE pg_try_advisory_lock(lock_key)
+		LIMIT 1
 	`
 
-	// Try each job until we get a lock
-	for i := 0; i < 10; i++ {
-		var job Job
-		rows, err := w.pool.Query(ctx, query, w.config.Queues, 0)
-		if err != nil {
-			return nil, fmt.Errorf("failed to query jobs: %w", err)
+	var job Job
+	err := w.pool.QueryRow(ctx, query, w.config.Queues).Scan(
+		&job.ID, &job.Queue, &job.Priority, &job.RunAt,
+		&job.Payload, &job.Error, &job.Attempts, &job.MaxAttempts,
+		&job.FinishedAt, &job.CreatedAt)
+	
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil
 		}
-		defer rows.Close()
-
-		// Find first available job
-		for rows.Next() {
-			err = rows.Scan(&job.ID, &job.Queue, &job.Priority, &job.RunAt,
-				&job.Payload, &job.Error, &job.Attempts, &job.MaxAttempts,
-				&job.FinishedAt, &job.CreatedAt)
-			if err != nil {
-				continue
-			}
-
-			lockKey := calculateLockKey(job.ID)
-
-			// Try to acquire advisory lock
-			var locked bool
-			err = w.pool.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", lockKey).Scan(&locked)
-			if err == nil && locked {
-				return &job, nil
-			}
-		}
-
-		// No jobs found, return nil
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
-
-		// Small delay before retry
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
+		return nil, fmt.Errorf("failed to fetch job: %w", err)
 	}
 
-	return nil, nil
+	return &job, nil
 }
 
 // execute processes a job
@@ -454,7 +592,7 @@ func (w *Worker) listenForNotifications() {
 	}
 	defer conn.Release()
 
-	_, err = conn.Exec(w.ctx, "LISTEN good_job")
+	_, err = conn.Exec(w.ctx, "LISTEN claude_job")
 	if err != nil {
 		logger.Error("Failed to LISTEN", "error", err)
 		return
@@ -592,25 +730,29 @@ func migrate(databaseURL string) error {
 }
 
 func printUsage() {
-	fmt.Println("GoodJob - PostgreSQL-based job queue for Go")
+	fmt.Println("Claude Jobs - PostgreSQL-based job queue for Go")
 	fmt.Println("")
 	fmt.Println("Usage:")
-	fmt.Println("  goodjob <command> [options]")
+	fmt.Println("  claude-jobs <command> [options]")
 	fmt.Println("")
 	fmt.Println("Commands:")
 	fmt.Println("  migrate              Create or update the database schema")
 	fmt.Println("  enqueue              Add a new job to the queue")
 	fmt.Println("  worker               Start processing jobs")
+	fmt.Println("  dashboard            Start the web dashboard")
+	fmt.Println("  serve                Start both worker and dashboard together")
 	fmt.Println("")
 	fmt.Println("Global Options:")
 	fmt.Println("  --database-url       PostgreSQL connection string (or DATABASE_URL env var)")
 	fmt.Println("")
 	fmt.Println("Examples:")
-	fmt.Println("  goodjob migrate --database-url postgresql://localhost/myapp")
-	fmt.Println("  goodjob enqueue --payload '{\"prompt\":\"write hello world in go\",\"cwd\":\"/tmp\"}'")
-	fmt.Println("  goodjob worker --concurrency 10 --queues high,default")
+	fmt.Println("  claude-jobs migrate --database-url postgresql://localhost/myapp")
+	fmt.Println("  claude-jobs enqueue --payload '{\"prompt\":\"write hello world in go\",\"cwd\":\"/tmp\"}'")
+	fmt.Println("  claude-jobs worker --concurrency 10 --queues high,default")
+	fmt.Println("  claude-jobs dashboard --port 8080")
+	fmt.Println("  claude-jobs serve --concurrency 5 --port 8080")
 	fmt.Println("")
-	fmt.Println("Default job handler executes: claude --dangerously-skip-permissions <prompt>")
+	fmt.Println("Default job handler executes: claude --dangerously-skip-permissions --verbose <prompt>")
 	fmt.Println("Required payload fields: prompt (string), optional: cwd (string)")
 }
 
@@ -638,7 +780,7 @@ func runEnqueue(args []string) {
 	priority := fs.Int("priority", 0, "Job priority (higher is processed first)")
 	payload := fs.String("payload", "{}", "JSON payload for the job")
 	delay := fs.Duration("delay", 0, "Delay before job should run")
-	maxAttempts := fs.Int("max-attempts", 5, "Maximum retry attempts")
+	maxAttempts := fs.Int("max-attempts", 3, "Maximum retry attempts")
 
 	fs.Parse(args)
 
@@ -738,6 +880,213 @@ func runWorker(args []string) {
 	}
 }
 
+func runDashboard(args []string) {
+	fs := flag.NewFlagSet("dashboard", flag.ExitOnError)
+	databaseURL := fs.String("database-url", os.Getenv("DATABASE_URL"), "PostgreSQL connection string")
+	port := fs.String("port", "8080", "Port to listen on")
+
+	fs.Parse(args)
+
+	if *databaseURL == "" {
+		logger.Error("Database URL is required (use --database-url or DATABASE_URL env var)")
+		os.Exit(1)
+	}
+
+	poolConfig, err := pgxpool.ParseConfig(*databaseURL)
+	if err != nil {
+		logger.Error("Failed to parse database URL", "error", err)
+		os.Exit(1)
+	}
+
+	pool, err := pgxpool.NewWithConfig(context.Background(), poolConfig)
+	if err != nil {
+		logger.Error("Failed to create connection pool", "error", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	server := &DashboardServer{pool: pool}
+
+	http.HandleFunc("/", server.handleDashboard)
+	http.HandleFunc("/api/jobs", server.handleJobsAPI)
+	http.HandleFunc("/api/stats", server.handleStatsAPI)
+
+	logger.Info("Starting dashboard server", "port", *port)
+	if err := http.ListenAndServe(":"+*port, nil); err != nil {
+		logger.Error("Failed to start server", "error", err)
+		os.Exit(1)
+	}
+}
+
+func runServe(args []string) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	databaseURL := fs.String("database-url", os.Getenv("DATABASE_URL"), "PostgreSQL connection string")
+	concurrency := fs.Int("concurrency", 5, "Number of concurrent workers")
+	queues := fs.String("queues", "default", "Comma-separated list of queues to process")
+	port := fs.String("port", "8080", "Port for dashboard to listen on")
+
+	fs.Parse(args)
+
+	if *databaseURL == "" {
+		logger.Error("Database URL is required (use --database-url or DATABASE_URL env var)")
+		os.Exit(1)
+	}
+
+	// Start worker in a goroutine
+	go func() {
+		config := &Config{
+			DatabaseURL:  *databaseURL,
+			Concurrency:  *concurrency,
+			Queues:       strings.Split(*queues, ","),
+			PollInterval: 5 * time.Second,
+		}
+
+		worker, err := NewWorker(config)
+		if err != nil {
+			logger.Error("Failed to create worker", "error", err)
+			os.Exit(1)
+		}
+
+		// Register claude handler for jobs with type "claude"
+		worker.RegisterHandler("claude", DefaultHandler)
+
+		logger.Info("Starting worker", "concurrency", *concurrency, "queues", *queues)
+		if err := worker.Start(); err != nil {
+			logger.Error("Worker failed to start", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	// Give worker a moment to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Start dashboard in main thread
+	poolConfig, err := pgxpool.ParseConfig(*databaseURL)
+	if err != nil {
+		logger.Error("Failed to parse database URL", "error", err)
+		os.Exit(1)
+	}
+
+	pool, err := pgxpool.NewWithConfig(context.Background(), poolConfig)
+	if err != nil {
+		logger.Error("Failed to create connection pool", "error", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	server := &DashboardServer{pool: pool}
+
+	http.HandleFunc("/", server.handleDashboard)
+	http.HandleFunc("/api/jobs", server.handleJobsAPI)
+	http.HandleFunc("/api/stats", server.handleStatsAPI)
+
+	logger.Info("Starting dashboard server", "port", *port)
+	logger.Info("Claude Jobs system running - Worker and Dashboard started")
+	logger.Info("Dashboard available at http://localhost:" + *port)
+	if err := http.ListenAndServe(":"+*port, nil); err != nil {
+		logger.Error("Failed to start server", "error", err)
+		os.Exit(1)
+	}
+}
+
+func (s *DashboardServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprint(w, dashboardHTML)
+}
+
+func (s *DashboardServer) handleStatsAPI(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	query := `
+		SELECT 
+			COUNT(CASE WHEN finished_at IS NULL AND run_at > now() THEN 1 END) as queued,
+			COUNT(CASE WHEN finished_at IS NULL AND run_at <= now() THEN 1 END) as running,
+			COUNT(CASE WHEN finished_at IS NOT NULL AND error IS NULL THEN 1 END) as finished,
+			COUNT(CASE WHEN finished_at IS NOT NULL AND error IS NOT NULL THEN 1 END) as failed
+		FROM claude_jobs
+	`
+
+	var stats JobStats
+	err := s.pool.QueryRow(ctx, query).Scan(&stats.Queued, &stats.Running, &stats.Finished, &stats.Failed)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
+}
+
+func (s *DashboardServer) handleJobsAPI(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	status := r.URL.Query().Get("status")
+
+	query := `
+		SELECT id, queue, priority, run_at, payload, error, attempts, max_attempts, finished_at, created_at
+		FROM claude_jobs
+	`
+
+	whereClause := ""
+	switch status {
+	case "queued":
+		whereClause = " WHERE finished_at IS NULL AND run_at > now()"
+	case "running":
+		whereClause = " WHERE finished_at IS NULL AND run_at <= now()"
+	case "finished":
+		whereClause = " WHERE finished_at IS NOT NULL AND error IS NULL"
+	case "failed":
+		whereClause = " WHERE finished_at IS NOT NULL AND error IS NOT NULL"
+	}
+
+	query += whereClause + " ORDER BY created_at DESC LIMIT 100"
+
+	rows, err := s.pool.Query(ctx, query)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var jobs []JobView
+	for rows.Next() {
+		var job Job
+		err := rows.Scan(&job.ID, &job.Queue, &job.Priority, &job.RunAt, &job.Payload,
+			&job.Error, &job.Attempts, &job.MaxAttempts, &job.FinishedAt, &job.CreatedAt)
+		if err != nil {
+			continue
+		}
+
+		// Determine status
+		status := "queued"
+		if job.FinishedAt != nil {
+			if job.Error != nil {
+				status = "failed"
+			} else {
+				status = "finished"
+			}
+		} else if job.RunAt.Before(time.Now()) {
+			status = "running"
+		}
+
+		jobs = append(jobs, JobView{
+			ID:          job.ID,
+			Queue:       job.Queue,
+			Priority:    job.Priority,
+			Status:      status,
+			Payload:     string(job.Payload),
+			Error:       job.Error,
+			Attempts:    job.Attempts,
+			MaxAttempts: job.MaxAttempts,
+			CreatedAt:   job.CreatedAt,
+			RunAt:       job.RunAt,
+			FinishedAt:  job.FinishedAt,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(jobs)
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -754,6 +1103,10 @@ func main() {
 		runEnqueue(args)
 	case "worker":
 		runWorker(args)
+	case "dashboard":
+		runDashboard(args)
+	case "serve":
+		runServe(args)
 	case "help", "--help", "-h":
 		printUsage()
 	default:

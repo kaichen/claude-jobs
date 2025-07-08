@@ -1,4 +1,6 @@
-# 最小化 Go 版 Good Job 任务队列实现计划
+# Claude Job Queue
+
+最小化 Go 版 Good Job 任务队列实现计划
 
 > 目标：用 **Go + PostgreSQL** 重现 Good Job 的核心能力（持久化队列、多并发执行、LISTEN/NOTIFY、Advisory Lock 防重），并保持接口简单、可直接嵌入任意 Go 服务。
 
@@ -27,20 +29,20 @@
                                              │  UPDATE finished_at │
                                              ▼                     │
                                     ┌──────────────────┐           │
-                                    │   good_jobs tbl   │──────────┘
+                                    │   claude_jobs tbl   │──────────┘
                                     └──────────────────┘
 ```
 
-* **单表设计**：仿照 Good Job `good_jobs` 单表存储，一切状态都在行级字段完成。
+* **单表设计**：仿照 Good Job `claude_jobs` 单表存储，一切状态都在行级字段完成。
 * **互斥执行**：使用 `pg_try_advisory_lock(lock_key)` 抢锁，类似 Good Job 的 Ruby 实现。
-* **实时唤醒**：`NOTIFY good_job, '<queue>'` + 独立连接 `LISTEN good_job`。
+* **实时唤醒**：`NOTIFY claude_jobs, '<queue>'` + 独立连接 `LISTEN claude_jobs`。
 
 ## 2. 数据库模式（初版）
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
-CREATE TABLE good_jobs (
+CREATE TABLE claude_jobs (
   id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   queue            TEXT NOT NULL DEFAULT 'default',
   priority         INTEGER NOT NULL DEFAULT 0,
@@ -54,8 +56,8 @@ CREATE TABLE good_jobs (
 );
 
 -- 仅待执行 job 索引
-CREATE INDEX idx_good_jobs_pending
-  ON good_jobs (queue, priority DESC, run_at)
+CREATE INDEX idx_claude_jobs_pending
+  ON claude_jobs (queue, priority DESC, run_at)
   WHERE finished_at IS NULL;
 ```
 
@@ -64,9 +66,7 @@ CREATE INDEX idx_good_jobs_pending
 ## 3. Go 代码结构
 
 ```
-/cmd
-  worker/          # goodjob-worker 二进制
-  migrate/         # 数据库迁移工具
+main.go
 /internal
   db/              # 连接池 wrapper（pgx）
   notifier/        # LISTEN/NOTIFY 封装
@@ -82,10 +82,10 @@ CREATE INDEX idx_good_jobs_pending
 | 包             | 责任                                                                                           |
 | ------------- | -------------------------------------------------------------------------------------------- |
 | `queue`       | `Enqueue(ctx, payload, opts)`、`Fetch(ctx, queues []string)`（含锁）                              |
-| `notifier`    | 后台 goroutine 监听 `LISTEN good_job`，收到消息后立即唤醒等待中的 worker                                       |
+| `notifier`    | 后台 goroutine 监听 `LISTEN claude_job`，收到消息后立即唤醒等待中的 worker                                       |
 | `worker`      | `Start(ctx, concurrency, queues)`：开 N 个 goroutine；对 `Fetch` 失败做指数退避；支持 `SIGINT/SIGTERM` 优雅停机 |
 | `locker`      | `TryLock(id int64)`/`Unlock(id int64)` —— PG advisory lock 封装                                |
-| `cmd/worker`  | CLI：`goodjob-worker --concurrency 5 --queues "high,default"`                                 |
+| `cmd/worker`  | CLI：`claudejq worker --concurrency 5 --queues "high,default"`                                 |
 | `cmd/migrate` | CLI：创建/升级表；支持 `--rollback`                                                                   |
 
 > ✅ **依赖**：`github.com/jackc/pgx/v5`, `github.com/cenkalti/backoff/v4`, `github.com/alecthomas/kingpin`（CLI），标准库 `context`, `sync`, `time`.
@@ -96,8 +96,8 @@ CREATE INDEX idx_good_jobs_pending
 
    ```go
    func Enqueue(ctx, payload, queue, priority, runAt, maxAttempts)
-   INSERT INTO good_jobs … RETURNING id;
-   NOTIFY good_job, queue;
+   INSERT INTO claude_job … RETURNING id;
+   NOTIFY claude_job, queue;
    ```
 
 2. **Worker Fetch**
@@ -105,7 +105,7 @@ CREATE INDEX idx_good_jobs_pending
    ```sql
    WITH job AS (
      SELECT id
-     FROM good_jobs
+     FROM claude_jobs
      WHERE queue = ANY($queues)
        AND run_at <= now()
        AND finished_at IS NULL

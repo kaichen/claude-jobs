@@ -16,6 +16,7 @@ claude --dangerously-skip-permissions -p --verbose <prompt>
 - **Automatic retries** - Exponential backoff for failed jobs
 - **Priority queues** - Jobs processed by priority and creation time
 - **Delayed execution** - Schedule jobs to run in the future
+- **Web dashboard** - Real-time monitoring interface with Tailwind CSS and HTMX
 
 ## Prerequisites
 
@@ -160,6 +161,19 @@ go run main.go enqueue [options]
   --max-attempts     Maximum retry attempts (default: 5)
 ```
 
+#### dashboard - Start web monitoring interface
+```bash
+go run main.go dashboard [options]
+  --database-url      PostgreSQL connection string (or DATABASE_URL env var)
+  --port             Port to listen on (default: "8080")
+```
+
+The dashboard provides:
+- Real-time job statistics (queued, running, finished, failed)
+- Filterable job list with status tabs
+- Auto-refresh using HTMX (stats every 2s, jobs every 5s)
+- Responsive design with Tailwind CSS
+
 ## Architecture
 
 The implementation follows these key principles:
@@ -181,7 +195,27 @@ The implementation follows these key principles:
 
 ## Monitoring
 
-Monitor job queue health with SQL queries:
+### Web Dashboard
+
+Start the web dashboard to monitor jobs in real-time:
+
+```bash
+# Start dashboard on default port 8080
+go run main.go dashboard
+
+# Use custom port
+go run main.go dashboard --port 9000
+```
+
+Access the dashboard at `http://localhost:8080` to view:
+- Job statistics with color-coded counts
+- Filterable job list (All, Queued, Running, Finished, Failed)
+- Job details including payload, attempts, and timestamps
+- Auto-refreshing data without page reloads
+
+### SQL Queries
+
+You can also monitor job queue health with SQL queries:
 
 ```sql
 -- Pending jobs by queue
@@ -216,7 +250,6 @@ ORDER BY minute;
 ## Limitations
 
 This minimal implementation does not include:
-- Web dashboard (use SQL queries for monitoring)
 - Batch jobs
 - Cron/scheduled recurring jobs
 - Job dependencies

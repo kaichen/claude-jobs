@@ -47,6 +47,15 @@ go run main.go enqueue --payload='{"prompt":"explain this code","cwd":"."}'
 go run main.go enqueue --queue=high --priority=10 --delay=5m --payload='{"prompt":"analyze security"}'
 ```
 
+### Web Dashboard
+```bash
+# Start dashboard on default port 8080
+go run main.go dashboard
+
+# Start dashboard on custom port
+go run main.go dashboard --port=9000
+```
+
 ### Testing
 ```bash
 # Run all tests (when tests are added)
@@ -68,6 +77,7 @@ The entire job queue system is implemented in `main.go` containing:
 - Worker pool implementation
 - CLI interface
 - Default Claude CLI handler
+- Web dashboard with real-time updates
 
 ### Core Components
 1. **Job** - Represents a queued job with payload, status, and metadata
@@ -75,6 +85,9 @@ The entire job queue system is implemented in `main.go` containing:
 3. **Config** - Worker configuration (concurrency, queues, poll interval)
 4. **JobHandler** - Function type for processing specific job types
 5. **EnqueueOptions** - Options for job scheduling (queue, priority, delay)
+6. **DashboardServer** - Web server for monitoring interface
+7. **JobStats** - Aggregated statistics for dashboard display
+8. **JobView** - Job representation for API responses
 
 ### PostgreSQL Features Used
 - Advisory locks for preventing duplicate job execution
@@ -86,9 +99,22 @@ The entire job queue system is implemented in `main.go` containing:
 ### Default Handler Behavior
 The default job handler executes Claude CLI:
 ```bash
-claude --dangerously-skip-permissions -p "<prompt>"
+claude --dangerously-skip-permissions --verbose -p "<prompt>"
 ```
-With optional working directory specified in payload.
+With optional working directory specified in payload. Job output is logged to:
+- `$HOME/.local/shared/claude-jobs/logs/{job-id}-{timestamp}.stdout.log`
+- `$HOME/.local/shared/claude-jobs/logs/{job-id}-{timestamp}.stderr.log`
+
+### Web Dashboard Features
+The dashboard provides:
+- Real-time job statistics (auto-refresh every 2 seconds)
+- Filterable job list by status (auto-refresh every 5 seconds)
+- Responsive design using Tailwind CSS from CDN
+- Dynamic updates without page reload using HTMX
+- API endpoints:
+  - `/` - Dashboard HTML interface
+  - `/api/stats` - Job statistics JSON
+  - `/api/jobs?status={queued|running|finished|failed}` - Job list JSON
 
 ## Development Guidelines
 
